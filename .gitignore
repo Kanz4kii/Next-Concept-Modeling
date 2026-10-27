@@ -1,0 +1,30 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large binary datasets & cached preprocessed data
+*.bin
+*.pt
+*.pth
+
+# Model checkpoints & weights (do not commit gigabytes of weights to git)
+checkpoints/
+checkpoints_v2/
+v1_backup/
+*.safetensors
+
+# Weights & Biases telemetry logs
+wandb/
+
+# IDE & OS specific files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,16 @@
+# Core Deep Learning
+torch>=2.4.0
+numpy>=1.26.0
+vector-quantize-pytorch>=1.20.0
+
+# NLP & Tokenization
+transformers>=4.44.0
+datasets>=3.0.0
+
+# Efficient Training & Checkpointing
+safetensors>=0.4.5
+bitsandbytes>=0.44.0
+
+# Experiment Tracking & Utilities
+wandb>=0.18.0
+tqdm>=4.66.0
