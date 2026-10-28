@@ -289,12 +289,13 @@ class NCMModel(nn.Module):
         repetition_penalty: float = 1.25,
         repetition_window: int = 64,
         eos_token_id: Optional[int] = 50256,
+        reground_concepts: bool = False,
     ) -> torch.Tensor:
-        """Closed-Loop Block-Autoregressive Generation (NCM v2).
+        """Hierarchical Block-Autoregressive Generation (NCM v2).
 
-        Interleaves high-level Concept Planning (1 concept step per `r` tokens) with
-        KV-cached Semi-Autoregressive Token Realization (`r` causal token steps per concept),
-        re-grounding the concept sequence in the actual generated tokens after each block.
+        Plans high-level discrete concepts at 4x temporal compression (1 concept per `r` tokens),
+        upsamples planned latents in a single batched pass, and realizes surface tokens via
+        the lightweight 5-layer KV-cached causal decoder.
         """
         assert isinstance(prompt_token_ids, torch.Tensor), "prompt_token_ids must be a torch.Tensor"
         assert prompt_token_ids.ndim == 2, f"Expected 2D tensor [B, T_prompt], got {prompt_token_ids.ndim}D"
@@ -324,7 +325,15 @@ class NCMModel(nn.Module):
         decoder_mod = getattr(self.decoder, "_orig_mod", self.decoder)
         planner_mod = getattr(self.planner, "_orig_mod", self.planner)
 
-        # 2. Prefill SurfaceDecoder KV-Cache over the aligned prompt
+        # 2. Prefill Planner & SurfaceDecoder KV-Caches over the aligned prompt
+        planner_kv_caches = planner_mod.prefill_kv_cache(
+            prompt_indices=current_concepts[:, :-1],
+            prompt_latents=prompt_latents[:, :-1],
+        )
+        planner_pos = current_concepts.size(1) - 1
+        last_concept_idx = current_concepts[:, -1:]                             # [B, 1, Q] or [B, 1]
+        last_concept_latent = prompt_latents[:, -1:]                            # [B, 1, concept_dim]
+
         decoder_kv_caches = decoder_mod.prefill_kv_cache(
             prompt_concept_latents=prompt_latents,
             aligned_prompt_ids=aligned_tokens,
@@ -333,28 +342,70 @@ class NCMModel(nn.Module):
 
         cur_token_pos = aligned_tokens.size(1)
         last_token_id = aligned_tokens[:, -1:]                                  # [B, 1]
-        history_ids = prompt_token_ids.clone()                                  # [B, T_prompt + generated]
-
         num_new_concepts = math.ceil(max_new_tokens / r)
+
+        # Fast Hierarchical Path (default): Plan concepts -> Single Batched Upsample -> 5-Layer KV Token Realization
+        if not reground_concepts and hasattr(decoder_mod, "decode_planned_latents"):
+            planned_latents_list: list[torch.Tensor] = []
+            for _ in range(num_new_concepts):
+                planned_concept, planner_kv_caches = planner_mod.step_kv_cache(
+                    cur_concept_idx=last_concept_idx,
+                    cur_concept_latent=last_concept_latent,
+                    kv_caches=planner_kv_caches,
+                    start_pos=planner_pos,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                )
+                planner_pos += 1
+                block_latent = self.tokenizer.decode(planned_concept)           # [B, 1, concept_dim]
+                planned_latents_list.append(block_latent)
+                last_concept_idx = planned_concept
+                last_concept_latent = block_latent
+
+            planned_concept_latents = torch.cat(planned_latents_list, dim=1)    # [B, num_new_concepts, concept_dim]
+            history_ids = decoder_mod.decode_planned_latents(
+                planned_concept_latents=planned_concept_latents,
+                last_token_id=last_token_id,
+                text_embeddings=self.text_embeddings,
+                kv_caches=decoder_kv_caches,
+                start_pos=cur_token_pos,
+                prompt_token_ids=prompt_token_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=token_temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
+                eos_token_id=eos_token_id,
+            )
+            if was_training:
+                self.train()
+            return history_ids
+
+        # Interleaved Re-grounding Path (when reground_concepts=True)
+        history_ids = prompt_token_ids.clone()                                  # [B, T_prompt + generated]
         tokens_generated = 0
 
-        # 3. Interleaved Block-Autoregressive Loop: 1 Concept Step -> r Token Steps -> Grounding
         for _ in range(num_new_concepts):
             tokens_remaining = max_new_tokens - tokens_generated
             if tokens_remaining <= 0:
                 break
 
-            # 3a. Planner predicts the next 1 concept block
-            next_concept_seq = planner_mod.generate(
-                prompt_indices=current_concepts,
-                max_new_concepts=1,
+            # 3a. Planner predicts the next 1 concept block via O(1) KV-cache step
+            planned_concept, planner_kv_caches = planner_mod.step_kv_cache(
+                cur_concept_idx=last_concept_idx,
+                cur_concept_latent=last_concept_latent,
+                kv_caches=planner_kv_caches,
+                start_pos=planner_pos,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 min_p=min_p,
-                concept_decoder=self.tokenizer.decode,
             )
-            planned_concept = next_concept_seq[:, -1:]                          # [B, 1, Q] or [B, 1]
+            planner_pos += 1
             block_latent = self.tokenizer.decode(planned_concept)               # [B, 1, concept_dim]
 
             # 3b. SurfaceDecoder autoregressively realizes up to `r` tokens for this concept block
@@ -394,10 +445,12 @@ class NCMModel(nn.Module):
                 # Re-encode the last 4 blocks (16 tokens) for exact causal conv context
                 tail_tokens = aligned_tokens[:, -min(aligned_tokens.size(1), 4 * r) :]
                 tail_emb = self.text_embeddings(tail_tokens)
-                grounded_last_concept = self.tokenizer.encode(tail_emb).indices[:, -1:]
-                current_concepts = torch.cat([current_concepts, grounded_last_concept], dim=1)
+                tok_tail = self.tokenizer.encode(tail_emb)
+                last_concept_idx = tok_tail.indices[:, -1:]
+                last_concept_latent = tok_tail.quantized[:, -1:]
             else:
-                current_concepts = next_concept_seq
+                last_concept_idx = planned_concept
+                last_concept_latent = block_latent
 
         if was_training:
             self.train()

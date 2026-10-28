@@ -20,9 +20,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, L, D]
-        norm_x = x.float().pow(2).mean(dim=-1, keepdim=True)            # [B, L, 1]
-        x_normed = x * torch.rsqrt(norm_x + self.eps).type_as(x)        # [B, L, D]
-        return self.weight * x_normed                                   # [B, L, D]
+        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -44,8 +42,8 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)                           # [max_seq_len, head_dim // 2]
         emb = torch.cat((freqs, freqs), dim=-1)                         # [max_seq_len, head_dim]
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0), persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -64,8 +62,8 @@ class RotaryEmbedding(nn.Module):
         if start_pos + seq_len > self.max_seq_len:
             self._build_cache(start_pos + seq_len)
 
-        cos = self.cos_cached[start_pos : start_pos + seq_len].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, L, head_dim]
-        sin = self.sin_cached[start_pos : start_pos + seq_len].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, L, head_dim]
+        cos = self.cos_cached[:, :, start_pos : start_pos + seq_len].to(dtype=q.dtype)  # [1, 1, L, head_dim]
+        sin = self.sin_cached[:, :, start_pos : start_pos + seq_len].to(dtype=q.dtype)  # [1, 1, L, head_dim]
 
         q_embed = (q * cos) + (self._rotate_half(q) * sin)              # [B, H, L, head_dim]
         k_embed = (k * cos) + (self._rotate_half(k) * sin)              # [B, H, L, head_dim]
@@ -143,25 +141,14 @@ class CausalSelfAttention(nn.Module):
         new_kv_cache = (k, v)
         is_causal = (kv_cache is None) and (K > 1)
 
-        if q.is_cuda:
-            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
-                attn_out = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=is_causal,
-                )                                                       # [B, H, K, head_dim]
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_causal,
-            )                                                           # [B, H, K, head_dim]
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )                                                               # [B, H, K, head_dim]
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)  # [B, K, D]
         out = self.out_proj(attn_out)                                   # [B, K, D]
@@ -212,27 +199,36 @@ def sample_logits(
     min_p: Optional[float] = None,
 ) -> torch.Tensor:
     """Samples discrete indices from logits [..., V] using Temperature, Min-P, Top-K, and Nucleus (Top-P) filtering."""
-    logits = logits.float()
     if temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
-    scaled_logits = logits / max(temperature, 1e-5)
+    scaled_logits = logits.float() / max(temperature, 1e-5)
 
-    # 1. Min-P filtering: prune tokens whose probability is less than min_p * max_p
+    # Fast path when Top-K is enabled: torch.topk already returns values sorted descending,
+    # allowing Min-P, Top-P, Softmax, and Multinomial to run on [..., K] instead of [..., V].
+    if top_k is not None and 0 < top_k < scaled_logits.size(-1):
+        top_k_vals, top_k_indices = torch.topk(scaled_logits, top_k, dim=-1)
+        probs = F.softmax(top_k_vals, dim=-1)
+
+        if min_p is not None and 0.0 < min_p < 1.0:
+            threshold = min_p * probs[..., :1]
+            probs = probs.masked_fill(probs < threshold, 0.0)
+
+        if top_p is not None and 0.0 < top_p < 1.0:
+            cumulative_probs = torch.cumsum(probs, dim=-1)
+            remove_mask = (cumulative_probs - probs) >= top_p
+            remove_mask[..., 0] = False
+            probs = probs.masked_fill(remove_mask, 0.0)
+
+        sampled_local = torch.multinomial(probs.reshape(-1, top_k), num_samples=1).view(*logits.shape[:-1], 1)
+        return torch.gather(top_k_indices, -1, sampled_local)
+
+    # Full-vocab fallback when top_k is disabled
     if min_p is not None and 0.0 < min_p < 1.0:
         probs = F.softmax(scaled_logits, dim=-1)
         max_probs = probs.max(dim=-1, keepdim=True).values
-        threshold = min_p * max_probs
-        scaled_logits = scaled_logits.masked_fill(probs < threshold, float("-inf"))
+        scaled_logits = scaled_logits.masked_fill(probs < min_p * max_probs, float("-inf"))
 
-    # 2. Top-K filtering
-    if top_k is not None and top_k > 0:
-        k = min(top_k, scaled_logits.size(-1))
-        top_k_vals, _ = torch.topk(scaled_logits, k, dim=-1)
-        threshold = top_k_vals[..., -1, None]
-        scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
-
-    # 3. Top-P (Nucleus) filtering
     if top_p is not None and 0.0 < top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -474,6 +470,63 @@ class ConceptPlanner(nn.Module):
             self.train()
 
         return generated
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def prefill_kv_cache(
+        self,
+        prompt_indices: torch.Tensor,
+        prompt_latents: Optional[torch.Tensor] = None,
+    ) -> list[Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        """Populates the Planner KV-cache over prefix concepts."""
+        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [None] * len(self.layers)
+        if prompt_indices.size(1) == 0:
+            return kv_caches
+        x = self._embed_indices(prompt_indices)
+        if prompt_latents is not None:
+            x = x + prompt_latents.to(dtype=x.dtype)
+        for i, layer in enumerate(self.layers):
+            x, kv_caches[i] = layer(x, kv_cache=None, start_pos=0)
+        return kv_caches
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def step_kv_cache(
+        self,
+        cur_concept_idx: torch.Tensor,
+        cur_concept_latent: Optional[torch.Tensor],
+        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]],
+        start_pos: int,
+        temperature: float = 0.7,
+        top_k: Optional[int] = 40,
+        top_p: Optional[float] = 0.9,
+        min_p: Optional[float] = 0.05,
+    ) -> tuple[torch.Tensor, list[Optional[tuple[torch.Tensor, torch.Tensor]]]]:
+        """Executes a single O(1) KV-cached concept prediction step."""
+        is_2d = cur_concept_idx.ndim == 2
+        x = self._embed_indices(cur_concept_idx)                        # [B, 1, concept_dim]
+        if cur_concept_latent is not None:
+            x = x + cur_concept_latent.to(dtype=x.dtype)
+        for i, layer in enumerate(self.layers):
+            x, kv_caches[i] = layer(x, kv_cache=kv_caches[i], start_pos=start_pos)
+        x_last = self.norm(x[:, -1:, :])                                # [B, 1, concept_dim]
+        if is_2d:
+            next_logits = self.lm_heads[0](x_last).squeeze(1)           # [B, V]
+        else:
+            next_logits = torch.stack(
+                [head(x_last).squeeze(1) for head in self.lm_heads], dim=1
+            )                                                           # [B, Q, V]
+
+        sampled = sample_logits(
+            next_logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+        )
+        if not is_2d:
+            sampled = sampled.squeeze(-1).unsqueeze(1)                  # [B, 1, Q]
+        return sampled, kv_caches
 
 
 if __name__ == "__main__":

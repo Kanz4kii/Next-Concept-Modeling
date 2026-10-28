@@ -123,22 +123,22 @@ Trained on 1 Billion tokens of **FineWeb-Edu** (`sample-10BT`) followed by **10,
 
 ### Head-to-Head Benchmark: NCM v2 vs. Standard Transformer (GPT-2 124M)
 
-To evaluate the efficiency gains of Hierarchical Concept Modeling over standard token-level autoregression, we measured empirical throughput and peak VRAM side-by-side on identical hardware (`NVIDIA GeForce RTX 5050` 8GB VRAM, PyTorch 2.4+ `bfloat16`, FlashAttention SDPA):
+To evaluate the efficiency gains of Hierarchical Concept Modeling over standard token-level autoregression, we measured empirical throughput, latency, and peak VRAM in isolated runs on identical hardware (`NVIDIA GeForce RTX 5050` 8GB VRAM, PyTorch `bfloat16`, FlashAttention SDPA, `AdamW8bit`):
 
 | Metric / Benchmark | Standard Transformer (GPT-2) | NCM v2 (Hierarchical) | NCM Advantage |
 | :--- | :---: | :---: | :---: |
 | **Model Parameters** | 124.48M (12 layers, $D=768$) | **101.88M** (5 planner + 5 decoder) | **18.2% leaner** |
-| **Training Throughput ($B=4, T=1024$)** | 880 tok/s *(WDDM paging to RAM)* | **16,094 tok/s** | **`18.28x` faster** |
-| **Peak VRAM ($B=4, T=1024$)** | 9,315 MB *(spills over 8GB VRAM)* | **4,663 MB** | **`2.00x` less VRAM** |
-| **OOM Resilience ($B=8, T=1024$)** | ❌ `CUDA OutOfMemoryError` | ✅ **Smooth execution** (~6.8 GB) | **Runs where GPT-2 crashes** |
-| **Inference Generation Speed** | 50.6 tok/s | **56.6 tok/s** | **`1.12x` faster** |
+| **Train Throughput ($B=4, T=1024$ — In-VRAM)** | 6,667 tok/s (`7,055 MB`) | **23,359 tok/s** (`3,233 MB`) | **`3.50x` faster & `2.18x` less VRAM** |
+| **Train Throughput ($B=8, T=1024$ — High Batch)** | 455 tok/s (`13,063 MB` — *RAM paging*) | **27,652 tok/s** (`5,583 MB`) | **`60.8x` faster (no VRAM spillover)** |
+| **Single-Stream Inference ($B=1, 128\text{ tok}$)** | 67.1 tok/s (`1,908 ms`) | **122.4 tok/s** (`1,045 ms`) | **`1.82x` faster latency** |
+| **Batched Inference ($B=16, 2048\text{ tok}$)** | 1,060.8 tok/s | **1,948.7 tok/s** | **`1.84x` higher throughput** |
 | **High-Level Attention Complexity** | $O(T^2) = 1,048,576$ pairs | $O((T/4)^2) = 65,536$ pairs | **`16x` fewer attention pairs** |
 | **Total Layer Passes ($T=1024$)** | $12 \times 1024 = \mathbf{12,288}$ | $(5 \times 256) + (5 \times 1024) = \mathbf{6,400}$ | **`47.9%` fewer layer-token passes** |
 
-> **Why did the Standard Transformer collapse to 880 tok/s?**
-> On consumer 8 GB GPUs, standard 12-layer GPT-2 at $B=4, T=1024$ accumulates over 9.3 GB of activation and optimizer state during backpropagation (tracking full $[B, T, V]$ projection tensors). This causes driver paging across PCIe to system RAM, which bottlenecks memory bandwidth.
-> 
-> In contrast, **NCM v2 confines quadratic attention to $K = 256$ concept latents**, decouples high-level semantic planning from low-level surface realization, and fits comfortably within 4.66 GB VRAM. At $B=8, T=1024$, standard GPT-2 crashes with `torch.OutOfMemoryError`, while NCM v2 executes seamlessly.
+> **Why is NCM v2 `3.50x` faster in training ($B=4$) and `1.84x` faster in inference?**
+> 1. **In-VRAM Compute ($B=4, T=1024$)**: Even when both models fit comfortably inside 8 GB VRAM, NCM v2 achieves **`23,359 tok/s`** vs GPT-2's **`6,667 tok/s`** (**`3.50x` speedup**) while using less than half the memory (`3,233 MB` vs `7,055 MB`). This is because the `ConceptPlanner` operates at $4\times$ temporal compression ($K=256, D=384$), reducing quadratic self-attention pairs by $16\times$, while the surface decoder only needs 5 layers instead of 12.
+> 2. **Large-Batch Scaling ($B=8, T=1024$)**: At $B=8$, standard GPT-2 demands **13.06 GB** of activation memory (due to retaining full $[B, T, V]$ logit graphs), forcing driver paging across PCIe to system RAM and collapsing throughput to `455 tok/s`. NCM v2 stays inside **`5.58 GB` VRAM** and scales smoothly up to **`27,652 – 31,200 tok/s`**.
+> 3. **Hierarchical Inference ($B=1$ & $B=16$)**: During generation, NCM v2 plans $M = \lceil T/4 \rceil$ concepts in compressed space, upsamples all planned concepts in a single batched pass, and steps through surface tokens with a 5-layer KV-cached decoder (`122.4 tok/s` at $B=1$ and **`1,948.7 tok/s`** at $B=16$).
 
 #### Reproduce the Benchmark
 Run the standalone reproducible benchmark script locally:

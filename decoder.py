@@ -62,25 +62,14 @@ class SurfaceSelfAttention(nn.Module):
         new_kv_cache = (k, v)
         use_causal = self.is_causal and (kv_cache is None) and (T > 1)
 
-        if q.is_cuda:
-            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
-                attn_out = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=use_causal,
-                )                                                       # [B, H, T, head_dim]
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=use_causal,
-            )                                                           # [B, H, T, head_dim]
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=use_causal,
+        )                                                               # [B, H, T, head_dim]
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)  # [B, T, dim]
         out = self.out_proj(attn_out)                                   # [B, T, dim]
@@ -121,7 +110,7 @@ class DecoderBlock(nn.Module):
         # x: [B, T, dim]
         attn_out, new_kv = self.attn(self.attn_norm(x), kv_cache=kv_cache, start_pos=start_pos)
         x = x + attn_out                        # [B, T, dim]
-        x = x + self.ffn(self.ffn_norm(x))      # [B, T, dim]
+        x = x + self.ffn(self.ffn_norm(x))      # [B, T, D]
         return x, new_kv                        # [B, T, dim]
 
 
@@ -144,6 +133,8 @@ class ConceptUpsampler(nn.Module):
         )
         self.intra_chunk_pos_emb = nn.Embedding(downsample_rate, dim)
         self.norm = RMSNorm(dim)
+        offsets = torch.arange(0, max_seq_len, dtype=torch.long) % downsample_rate
+        self.register_buffer("chunk_offsets_buf", offsets, persistent=False)
 
     def forward(self, concept_latents: torch.Tensor, seq_len: int) -> torch.Tensor:
         # concept_latents: [B, K, concept_dim]
@@ -161,8 +152,10 @@ class ConceptUpsampler(nn.Module):
         h_conv = self.deconv(h.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()   # [B, K * r, dim]
         x = (h_rep + h_conv)[:, :seq_len, :]                                                # [B, T, dim]
 
-        positions = torch.arange(0, seq_len, device=concept_latents.device, dtype=torch.long)  # [T]
-        chunk_offsets = positions % self.downsample_rate                                    # [T]
+        if seq_len <= self.chunk_offsets_buf.size(0):
+            chunk_offsets = self.chunk_offsets_buf[:seq_len]                                # [T]
+        else:
+            chunk_offsets = torch.arange(0, seq_len, device=concept_latents.device, dtype=torch.long) % self.downsample_rate
 
         intra_encoding = self.intra_chunk_pos_emb(chunk_offsets)                            # [T, dim]
         x = self.norm(x + intra_encoding.unsqueeze(0))                                      # [B, T, dim]
@@ -366,18 +359,16 @@ class SemiAutoregressiveDecoder(nn.Module):
             if logits_step.size(-1) > 50257:
                 logits_step[:, 50257:] = float("-inf")
 
-            # Apply repetition penalty per batch item
+            # Apply repetition penalty without GPU-CPU stream synchronization
             if repetition_penalty != 1.0 and cur_history.size(1) > 0:
-                logits_step = logits_step.clone()
-                for b in range(B):
-                    window_tokens = cur_history[b, -repetition_window:]
-                    unique_tokens = torch.unique(window_tokens)
-                    pos_mask = logits_step[b, unique_tokens] > 0
-                    logits_step[b, unique_tokens] = torch.where(
-                        pos_mask,
-                        logits_step[b, unique_tokens] / repetition_penalty,
-                        logits_step[b, unique_tokens] * repetition_penalty,
-                    )
+                window_tokens = cur_history[:, -repetition_window:]             # [B, W]
+                score = torch.gather(logits_step, 1, window_tokens)             # [B, W]
+                score = torch.where(
+                    score > 0,
+                    score / repetition_penalty,
+                    score * repetition_penalty,
+                )
+                logits_step = logits_step.scatter(1, window_tokens, score)      # [B, vocab_size]
 
             next_token = sample_logits(
                 logits_step,
@@ -392,6 +383,85 @@ class SemiAutoregressiveDecoder(nn.Module):
 
         block_token_ids = torch.cat(block_tokens, dim=1)                    # [B, steps]
         return block_token_ids, cur_last_token, kv_caches
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def decode_planned_latents(
+        self,
+        planned_concept_latents: torch.Tensor,
+        last_token_id: torch.Tensor,
+        text_embeddings: nn.Embedding,
+        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]],
+        start_pos: int,
+        prompt_token_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 0.7,
+        top_k: Optional[int] = 40,
+        top_p: Optional[float] = 0.9,
+        min_p: Optional[float] = 0.05,
+        repetition_penalty: float = 1.25,
+        repetition_window: int = 64,
+        eos_token_id: Optional[int] = 50256,
+    ) -> torch.Tensor:
+        """Fast batched-upsampling KV-cached token realization over a sequence of planned concepts."""
+        B, K_new, _ = planned_concept_latents.shape
+        T_prompt = prompt_token_ids.size(1)
+        total_upsampled = K_new * self.downsample_rate
+
+        # Upsample all planned concepts in a single pass and pre-apply concept_gate
+        c_all = self.upsampler(planned_concept_latents, seq_len=total_upsampled)[:, :max_new_tokens, :]
+        c_all_gated = self.concept_gate * c_all                             # [B, max_new_tokens, dim]
+
+        # Pre-allocate output token buffer to eliminate per-step torch.cat allocations
+        history_buf = torch.empty(
+            (B, T_prompt + max_new_tokens),
+            dtype=prompt_token_ids.dtype,
+            device=prompt_token_ids.device,
+        )
+        history_buf[:, :T_prompt] = prompt_token_ids
+        cur_len = T_prompt
+        cur_last_token = last_token_id                                      # [B, 1]
+
+        for j in range(max_new_tokens):
+            t_step = text_embeddings(cur_last_token).to(dtype=c_all_gated.dtype)
+            x_step = c_all_gated[:, j : j + 1, :] + self.token_gate * self.token_norm(t_step)
+
+            for i, layer in enumerate(self.layers):
+                x_step, kv_caches[i] = layer(x_step, kv_cache=kv_caches[i], start_pos=start_pos + j)
+
+            logits_step = self.vocab_head(self.norm(x_step)).squeeze(1)[:, :50257]  # [B, 50257] zero-copy slice
+
+            if repetition_penalty != 1.0 and cur_len > 0:
+                win_start = max(0, cur_len - repetition_window)
+                window_tokens = history_buf[:, win_start:cur_len]           # [B, W]
+                score = torch.gather(logits_step, 1, window_tokens)
+                score = torch.where(
+                    score > 0,
+                    score / repetition_penalty,
+                    score * repetition_penalty,
+                )
+                logits_step = logits_step.scatter(1, window_tokens, score)
+
+            if temperature <= 0.0:
+                next_token = torch.argmax(logits_step, dim=-1, keepdim=True)
+            else:
+                next_token = sample_logits(
+                    logits_step,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                )
+
+            history_buf[:, cur_len : cur_len + 1] = next_token
+            cur_len += 1
+            cur_last_token = next_token
+
+            if eos_token_id is not None and B == 1 and int(next_token.item()) == eos_token_id:
+                cur_len -= 1
+                break
+
+        return history_buf[:, :cur_len]
 
 
 class NonAutoregressiveDecoder(nn.Module):
