@@ -21,29 +21,35 @@
 
 ## What is Next-Concept Modeling?
 
-Standard Large Language Models (LLMs) operate strictly at the surface token level: predicting the single next subword token autoregressively:
+Standard Large Language Models (like GPT and LLaMA) predict text **one single token at a time**:
 
-$$
-P(y_1, y_2, \dots, y_T) = \prod_{t=1}^{T} P(y_t \mid y_{\lt t})
-$$
+```text
+"The" ➔ "capital" ➔ "of" ➔ "France" ➔ "is" ➔ "Paris"
+```
 
-While expressive, token-level autoregression forces the entire model capacity to perform both high-level semantic planning and low-level syntactic realization at every single step.
+This forces the entire neural network to perform two jobs simultaneously at every single token:
+1. **High-level semantic planning**: *"Where is the thought going? What is the main concept?"*
+2. **Low-level syntactic realization**: *"What preposition, case, or punctuation should come next?"*
 
-**Next-Concept Modeling (NCM)** splits this process into two hierarchical levels:
+**Next-Concept Modeling (NCM)** splits this process into two specialized levels:
 
-### Level 1: Concept Planning (`ConceptPlanner`)
-Compress spans of $r = 4$ tokens into a single discrete latent concept $c_k \in \mathcal{C}$ via **Residual Vector Quantization (RVQ)**. A causal transformer plans trajectories autoregressively in compressed concept space at $4\times$ temporal reduction:
+```
+[ Concept 1 ] ──────────────► [ Concept 2 ] ──────────────► [ Concept 3 ]
+ (Semantic Plan)               (Semantic Plan)               (Semantic Plan)
+       │                             │                             │
+       ▼                             ▼                             ▼
+ ["The", "capital"]            ["of", "France"]              ["is", "Paris."]
+```
 
-$$
-P(c_1, c_2, \dots, c_K) = \prod_{k=1}^{K} P(c_k \mid c_{\lt k})
-$$
+### Level 1: Semantic Planning (`ConceptPlanner`)
+- Compresses spans of $4$ surface tokens into a single discrete latent concept vector using **Residual Vector Quantization (RVQ-4)**.
+- Plans the flow of ideas in compressed concept space ($256$ concepts instead of $1024$ tokens).
+- Because attention is quadratic in sequence length, compressing $T$ by $4\times$ reduces self-attention pairs by **$16\times$** ($O((T/4)^2) = O(T^2 / 16)$).
 
-### Level 2: Semi-Autoregressive Surface Realization (`SemiAutoregressiveDecoder`)
-Given the planned concept $c_k$ and the causal history of tokens within the block, realize surface text with causal conditioning:
-
-$$
-P(y_{4k-3:4k} \mid c_k, y_{\lt 4k-3}) = \prod_{j=0}^{r-1} P(y_{4k-3+j} \mid y_{\lt 4k-3+j}, c_k)
-$$
+### Level 2: Surface Realization (`SemiAutoregressiveDecoder`)
+- A lightweight 5-layer decoder receives the planned concept vector.
+- Realizes the actual $4$ tokens causally, step-by-step.
+- Conditioning on both the planned concept and the previous token guarantees natural grammar and zero repetitive word-salad.
 
 ---
 
@@ -93,15 +99,19 @@ Compared to naive parallel non-autoregressive decoders (v1), NCM v2 introduces f
 
 ### 1. Semi-Autoregressive Causal Conditioning (No More Word-Salad)
 - **Problem in v1**: Predicting 4 tokens in parallel from a single concept vector led to the classical *conditional independence problem* (repeated determiners and prepositions like `"the the in of"`).
-- **Solution in v2**: The `SemiAutoregressiveDecoder` combines upsampled concept latents $c_{\text{up}}$ with causal shifted previous-token embeddings $t_{\text{in}}$ through dual learned gates:
-  $$x_t = g_c \cdot c_{\text{up}, t} + g_t \cdot \text{RMSNorm}(t_{\text{in}, t})$$
-  Every token $y_t$ within block $k$ directly conditions on the exact token $y_{t-1}$ chosen on the previous step.
+- **Solution in v2**: The `SemiAutoregressiveDecoder` combines concept features with previous-token embeddings using learned dual gates:
+  ```python
+  x_t = concept_gate * c_up + token_gate * RMSNorm(prev_token_emb)
+  ```
+  Every token $y_t$ directly conditions on the exact token $y_{t-1}$ chosen on the previous step.
 
 ### 2. Strided Receptive Field Alignment (Fixing CausalConv1d)
 - **Root Cause**: In standard causal strided convolutions, naive padding formulas `(K - 1) * dilation` introduce an off-by-stride phase shift where Concept $k$ misses the last 3 tokens of its assigned block.
 - **Formula in v2**:
-  $$\text{causal\_padding} = \max\bigl(0, (\text{kernel\_size} - 1) \cdot \text{dilation} - (\text{stride} - 1)\bigr)$$
-  For $\text{stride}=4, \text{kernel}=8$, padding is exactly $4$. Concept $k$ has full causal coverage over all 4 tokens of Block $k$ (`[4k .. 4k+3]`) plus 4 context tokens without future leakage.
+  ```python
+  causal_padding = max(0, (kernel_size - 1) * dilation - (stride - 1))
+  ```
+  For `stride=4, kernel_size=8`, padding is exactly `4`. Concept $k$ has full causal coverage over all 4 tokens of its block (`[4k .. 4k+3]`) plus 4 context tokens without future leakage.
 
 ### 3. Scheduled Concept Conditioning & Concept Dropout
 - To bridge the gap between teacher-forced training (oracle encoder concepts) and free-running generation (planner-predicted concepts), training randomly samples conditioning per block:
@@ -340,27 +350,19 @@ python generate.py \
 
 ## Loss Formulation
 
-The end-to-end loss jointly optimizes surface token prediction, autoregressive concept planning, and vector quantization commitment:
+The entire network is trained end-to-end using a single joint objective:
 
-$$
-\mathcal{L} = \mathcal{L}_{\text{text}} + \lambda_{\text{concept}} \cdot \mathcal{L}_{\text{concept}} + \mathcal{L}_{\text{VQ}}
-$$
+```text
+Total Loss = Text Loss + 0.5 * Concept Loss + VQ Commitment Loss
+```
 
-### 1. Surface Realization Loss
-$$
-\mathcal{L}_{\text{text}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(y_t \mid y_{\lt t}, c_{\le \lceil t/r \rceil})
-$$
+| Loss Component | Objective | What It Teaches |
+| :--- | :---: | :--- |
+| **`Text Loss`** | Cross-Entropy over vocabulary | Teaches the causal surface decoder to output grammatically correct, fluent words. |
+| **`Concept Loss`** | Cross-Entropy over RVQ codebooks | Teaches the high-level planner to forecast the next semantic thought trajectory. |
+| **`VQ Commitment Loss`** | L2 distance between latents and codes | Stabilizes the discrete codebook bottleneck and trains the convolutional encoder. |
 
-### 2. Next-Concept Planning Loss
-$$
-\mathcal{L}_{\text{concept}} = -\frac{1}{K-1}\sum_{k=1}^{K-1} \frac{1}{Q}\sum_{q=1}^{Q} \log P\bigl(c_{k+1}^{(q)} \mid c_{\le k}\bigr)
-$$
-
-### 3. Residual Vector Quantization Loss
-$$
-\mathcal{L}_{\text{VQ}} = \frac{1}{Q}\sum_{q=1}^{Q} \beta \cdot \| \text{sg}[z^{(q)}] - e^{(q)} \|_2^2
-$$
-where $\beta = 0.25$ and the **Rotation Trick** transports gradients across the discrete codebook bottleneck without bias.
+> **Gradient Routing**: We use Phil Wang's **Rotation Trick** to backpropagate gradients smoothly across discrete vector quantization without heuristic straight-through estimator biases.
 
 ---
 
