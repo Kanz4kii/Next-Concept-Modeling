@@ -233,7 +233,7 @@ reduce water usage and increase energy efficiency...
 ### 1. Installation
 
 ```bash
-git clone https://github.com/your-username/Next-Concept-Modeling.git
+git clone https://github.com/Kanz4kii/Next-Concept-Modeling.git
 cd Next-Concept-Modeling
 
 pip install -r requirements.txt
@@ -351,7 +351,7 @@ If you find this codebase useful in your research or applications, please cite:
   title = {Next-Concept Modeling (NCM v2): Semi-Autoregressive Hierarchical Language Modeling in PyTorch},
   year = {2026},
   publisher = {GitHub},
-  url = {https://github.com/your-username/Next-Concept-Modeling}
+  url = {https://github.com/Kanz4kii/Next-Concept-Modeling}
 }
 ```
 
