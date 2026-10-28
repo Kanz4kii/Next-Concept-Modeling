@@ -4,6 +4,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20Weights-ffcc4d.svg)](https://huggingface.co/Kanz4kii/Next-Concept-Modeling)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Parameters: 101.88M](https://img.shields.io/badge/Parameters-101.88M-green.svg)](#model-parameters--specifications)
 [![Throughput: ~31k tok/s](https://img.shields.io/badge/Speed-~31k%20tok%2Fs%20(RTX%205050)-purple.svg)](#performance--hardware-efficiency)
