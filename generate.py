@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import Optional, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -14,13 +15,63 @@ from interfaces import ModelArgs
 from model import NCMModel
 
 
+def resolve_tokenizer(tokenizer_name_or_path: str) -> AutoTokenizer:
+    """Loads tokenizer from local 'tokenizer/' directory if available, else from HuggingFace."""
+    local_dir = Path("tokenizer")
+    if local_dir.is_dir() and (local_dir / "tokenizer.json").exists():
+        try:
+            return AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
+        except Exception:
+            pass
+    return AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
+
+
+def resolve_checkpoint(
+    checkpoint_arg: Optional[str],
+    hf_repo: Optional[str] = None,
+) -> Tuple[Optional[Path], bool]:
+    """Resolves local checkpoint path or attempts to fetch from Hugging Face Hub if missing."""
+    candidates = []
+    if checkpoint_arg:
+        candidates.append(Path(checkpoint_arg))
+    candidates.extend([
+        Path("checkpoints_v2/ncm_sft_best.safetensors"),
+        Path("checkpoints_v2/ncm_best.safetensors"),
+        Path("checkpoints/ncm_sft_best.safetensors"),
+        Path("checkpoints/ncm_best.safetensors"),
+    ])
+
+    for cand in candidates:
+        if cand.is_file():
+            return cand, False
+
+    # Check if checkpoint_arg looks like an HF repo ID or hf_repo is explicitly set
+    repo_id = hf_repo or (checkpoint_arg if (checkpoint_arg and "/" in checkpoint_arg and not Path(checkpoint_arg).exists()) else None)
+    if repo_id:
+        try:
+            from huggingface_hub import hf_hub_download
+            print(f"[Hub] Downloading checkpoint from Hugging Face repository '{repo_id}'...")
+            downloaded = hf_hub_download(repo_id=repo_id, filename="ncm_sft_best.safetensors")
+            return Path(downloaded), False
+        except Exception as e:
+            print(f"[Warning] Failed to download from Hugging Face Hub ({e}).")
+
+    return None, True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate text using a pretrained Next-Concept Modeling (NCM) checkpoint")
     parser.add_argument(
         "--checkpoint",
         type=str,
         default="checkpoints_v2/ncm_sft_best.safetensors",
-        help="Path to the .safetensors checkpoint file",
+        help="Path to the .safetensors checkpoint file or Hugging Face repo ID",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=None,
+        help="Optional Hugging Face Hub repository identifier (e.g. 'kanzaki4real/ncm-100m') to auto-download weights",
     )
     parser.add_argument(
         "--prompt",
@@ -39,31 +90,42 @@ def main() -> None:
     parser.add_argument("--repetition-window", type=int, default=64, help="Context window size for repetition penalty")
     parser.add_argument("--ignore-eos", action="store_true", help="Do not stop early on eos_token_id")
     parser.add_argument("--num-quantizers", type=int, default=4, help="Number of ResidualVQ codebooks")
-    parser.add_argument("--tokenizer", type=str, default="gpt2", help="HuggingFace tokenizer name")
+    parser.add_argument("--tokenizer", type=str, default="tokenizer", help="Path to local tokenizer or HF tokenizer name")
     args_cli = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args_cli.tokenizer, use_fast=True)
-
-    model_args = ModelArgs(
-        vocab_size=50304,
-        dim=768,
-        concept_dim=384,
-        num_concepts=1024,
-        num_quantizers=args_cli.num_quantizers,
-        downsample_rate=4,
-        planner_layers=5,
-        decoder_layers=5,
-        num_heads=8,
-        max_seq_len=1024,
-    )
-
-    ckpt_path = Path(args_cli.checkpoint)
-    if ckpt_path.exists():
-        print(f"Loading checkpoint from {ckpt_path} onto {device}...")
-        model = NCMModel.from_safetensors(ckpt_path, args=model_args, device=device)
+    # Device configuration with safe multi-platform fallback (CUDA -> Apple MPS -> CPU)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        amp_device = "cuda"
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        amp_enabled = True
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        amp_device = "mps"
+        amp_dtype = torch.float32
+        amp_enabled = False
     else:
-        print(f"[Warning] Checkpoint '{ckpt_path}' not found; initializing untrained NCMModel for demonstration.")
+        device = torch.device("cpu")
+        amp_device = "cpu"
+        amp_dtype = torch.float32
+        amp_enabled = False
+
+    tokenizer = resolve_tokenizer(args_cli.tokenizer)
+
+    ckpt_path, is_demo = resolve_checkpoint(args_cli.checkpoint, hf_repo=args_cli.hf_repo)
+    if ckpt_path is not None and not is_demo:
+        print(f"Loading checkpoint from '{ckpt_path}' onto {device}...")
+        model = NCMModel.from_safetensors(ckpt_path, device=device)
+    else:
+        print("=" * 80)
+        print("[Notice] Pretrained .safetensors checkpoint not found locally.")
+        print("To download the trained weights from Hugging Face:")
+        print("    python generate.py --hf-repo kanzaki4real/ncm-100m")
+        print("Or place your checkpoint at 'checkpoints_v2/ncm_sft_best.safetensors'.")
+        print("Initializing model with random weights for zero-crash pipeline test...")
+        print("=" * 80)
+        config_path = Path("config.json")
+        model_args = ModelArgs.from_json(config_path) if config_path.exists() else ModelArgs()
         model = NCMModel(args=model_args).to(device)
 
     model.eval()
@@ -79,7 +141,7 @@ def main() -> None:
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
     print(f"\nPrompt ({prompt_ids.size(1)} tokens):\n{prompt_text}\n")
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+    with torch.no_grad(), torch.amp.autocast(device_type=amp_device, dtype=amp_dtype, enabled=amp_enabled):
         output_ids = model.generate_text(
             prompt_token_ids=prompt_ids,
             max_new_tokens=args_cli.max_new_tokens,

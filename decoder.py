@@ -394,8 +394,78 @@ class SemiAutoregressiveDecoder(nn.Module):
         return block_token_ids, cur_last_token, kv_caches
 
 
-# Backward compatibility alias
-NonAutoregressiveDecoder = SemiAutoregressiveDecoder
+class NonAutoregressiveDecoder(nn.Module):
+    """Original Parallel Non-Autoregressive Surface Realizer (NCM v1).
+
+    Maintained for complete backward compatibility with NCM v1 checkpoints.
+    Predicts surface tokens strictly in parallel from upsampled concept latents.
+    """
+
+    def __init__(
+        self,
+        args: ModelArgs,
+        num_heads: Optional[int] = None,
+        dropout: Optional[float] = None,
+        is_causal: bool = True,
+    ) -> None:
+        super().__init__()
+        self.args = args
+        self.dim = args.dim
+        self.concept_dim = args.concept_dim
+        self.vocab_size = args.vocab_size
+        self.downsample_rate = args.downsample_rate
+        self.max_seq_len = args.max_seq_len
+
+        heads = num_heads if num_heads is not None else args.num_heads
+        drop = dropout if dropout is not None else args.dropout
+
+        self.upsampler = ConceptUpsampler(
+            concept_dim=self.concept_dim,
+            dim=self.dim,
+            downsample_rate=self.downsample_rate,
+            max_seq_len=self.max_seq_len,
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                DecoderBlock(
+                    dim=self.dim,
+                    num_heads=heads,
+                    dropout=drop,
+                    max_seq_len=self.max_seq_len,
+                    rope_theta=args.rope_theta,
+                    is_causal=is_causal,
+                )
+                for _ in range(args.decoder_layers)
+            ]
+        )
+        self.norm = RMSNorm(self.dim)
+        self.vocab_head = nn.Linear(self.dim, self.vocab_size, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        concept_latents: torch.Tensor,
+        seq_len: int,
+        prev_token_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Parallel realization of token logits from latent concept representations."""
+        x = self.upsampler(concept_latents, seq_len=seq_len)    # [B, T, dim]
+        for layer in self.layers:
+            x, _ = layer(x)                                     # [B, T, dim]
+        x = self.norm(x)                                        # [B, T, dim]
+        token_logits = self.vocab_head(x)                       # [B, T, vocab_size]
+        return token_logits
 
 
 if __name__ == "__main__":

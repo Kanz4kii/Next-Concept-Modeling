@@ -182,16 +182,18 @@ reduce water usage and increase energy efficiency...
 ## Repository Structure
 
 ```
+├── config.json         # Architecture configuration (v1/v2, layer counts, dimensions)
+├── tokenizer/          # Bundled BPE tokenizer files (guaranteed 100% offline execution)
 ├── interfaces.py       # Strict type contracts: ModelArgs, TokenizerOutput, NCMOutput
 ├── vq_tokenizer.py     # RVQ-4 Tokenizer with Cosine Similarity, Rotation Trick, & CausalConv1d
 ├── planner.py          # Autoregressive ConceptPlanner (RoPE, FlashAttention SDPA, KV-Cache)
-├── decoder.py          # SemiAutoregressiveDecoder with dual gating and token KV-Cache
-├── model.py            # End-to-end NCMModel, Scheduled Conditioning, & Closed-Loop Generation
+├── decoder.py          # SemiAutoregressive (v2) & NonAutoregressive (v1) Surface Realizers
+├── model.py            # End-to-end NCMModel, Auto-Detection of Checkpoints, & Closed-Loop Generation
 ├── dataset.py          # FineWeb-Edu streaming pipeline & zero-RAM MemmapDataset
 ├── train.py            # Pretraining script with AdamW8bit, cosine scheduler, & WandB telemetry
 ├── sft_dataset.py      # Alpaca instruction-tuning dataset with selective label masking
 ├── sft_train.py        # SFT pipeline with frozen VQ codebooks & padding-masked concept loss
-├── generate.py         # Production inference CLI with Min-P, Repetition Penalty, & --chat
+├── generate.py         # Production inference CLI with Min-P, Repetition Penalty, HF auto-download, & --chat
 ├── test_overfit.py     # Deterministic verification suite (graph, gradients, closed-loop exact match)
 ├── requirements.txt    # Project dependencies
 └── LICENSE             # MIT License

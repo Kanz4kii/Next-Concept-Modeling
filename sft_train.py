@@ -130,7 +130,9 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tok_dir = Path("tokenizer")
+    tokenizer_path = tok_dir if tok_dir.is_dir() and (tok_dir / "tokenizer.json").exists() else "gpt2"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -158,34 +160,21 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         drop_last=False,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
     )
 
     # 2. Initialize Model and Load Pretrained Weights
-    model_args = ModelArgs(
-        vocab_size=50304,
-        dim=768,
-        concept_dim=384,
-        num_concepts=1024,
-        num_quantizers=4,
-        downsample_rate=4,
-        planner_layers=5,
-        decoder_layers=5,
-        num_heads=8,
-        max_seq_len=1024,
-    )
-
     base_ckpt = Path(args.base_checkpoint)
     assert base_ckpt.exists(), f"Base checkpoint '{base_ckpt}' not found!"
     print(f"Loading pretrained base model weights from '{base_ckpt}'...")
-    model = NCMModel.from_safetensors(base_ckpt, args=model_args, device=device)
+    model = NCMModel.from_safetensors(base_ckpt, device=device)
 
     # Freeze VQ Tokenizer codebooks to ensure concepts stay rock solid
     if args.freeze_codebook:

@@ -272,6 +272,7 @@ def train(
     resume: bool = False,
     resume_from: Optional[str] = None,
     compile_model: bool = True,
+    no_wandb: bool = False,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision("high")
@@ -392,33 +393,42 @@ def train(
             print(f"[Info] torch.compile submodule compilation failed ({e}), using eager SDPA.")
             compile_model = False
 
-    # Initialize Weights & Biases logging (seamlessly resumes the exact same WandB chart if `wandb_run_id` exists)
-    run = wandb.init(
-        project=wandb_project,
-        name=wandb_run_name,
-        id=wandb_run_id,
-        resume="allow" if (resume or resume_from is not None) else None,
-        config={
-            **vars(args),
-            "total_params": total_params,
-            "dataset_tokens": train_dataset.num_tokens,
-            "batch_size": batch_size,
-            "grad_accum_steps": grad_accum_steps,
-            "num_workers": num_workers,
-            "effective_batch_tokens": batch_size * grad_accum_steps * seq_len,
-            "max_steps": max_steps,
-            "total_schedule_steps": cosine_horizon,
-            "warmup_steps": warmup_steps,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "optimizer": "AdamW8bit",
-            "precision": "bfloat16",
-            "compiled": compile_model,
-        },
-    )
-    active_wandb_id = run.id if run is not None else wandb_run_id
-    if run is not None:
-        print(f"WandB Run URL: {run.url}", flush=True)
+    # Initialize Weights & Biases logging (if enabled)
+    run = None
+    if not no_wandb and wandb_project is not None:
+        try:
+            run = wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                id=wandb_run_id,
+                resume="allow" if (resume or resume_from is not None) else None,
+                config={
+                    **vars(args),
+                    "total_params": total_params,
+                    "dataset_tokens": train_dataset.num_tokens,
+                    "batch_size": batch_size,
+                    "grad_accum_steps": grad_accum_steps,
+                    "num_workers": num_workers,
+                    "effective_batch_tokens": batch_size * grad_accum_steps * seq_len,
+                    "max_steps": max_steps,
+                    "total_schedule_steps": cosine_horizon,
+                    "warmup_steps": warmup_steps,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "optimizer": "AdamW8bit",
+                    "precision": "bfloat16",
+                    "compiled": compile_model,
+                },
+            )
+            active_wandb_id = run.id if run is not None else wandb_run_id
+            if run is not None:
+                print(f"WandB Run URL: {run.url}", flush=True)
+        except Exception as e:
+            print(f"[Warning] WandB initialization failed ({e}). Proceeding without remote logging.")
+            run = None
+            active_wandb_id = wandb_run_id
+    else:
+        active_wandb_id = wandb_run_id
 
     model.train()
     data_iter = iter(dataloader)
@@ -508,7 +518,8 @@ def train(
                     "perf/tokens_per_sec": tokens_per_sec,
                     "perf/tflops": tflops_per_sec,
                 }
-                wandb.log(metrics, step=step)
+                if run is not None:
+                    wandb.log(metrics, step=step)
 
                 print(
                     f"Step {step:06d}/{max_steps} (sched:{cosine_horizon}) | "
@@ -523,7 +534,8 @@ def train(
 
             if step % eval_interval == 0 or step == max_steps:
                 val_metrics = evaluate_validation(model, val_loader, device=device)
-                wandb.log(val_metrics, step=step)
+                if run is not None:
+                    wandb.log(val_metrics, step=step)
                 print(
                     f"[Validation @ Step {step:06d}] "
                     f"Val Text Loss: {val_metrics['val/text_loss']:.4f} | "
@@ -562,7 +574,8 @@ def train(
         )
         print(f"[Interrupt] Saved safely at step {current_step}. Resume anytime with `--resume`.")
     finally:
-        wandb.finish()
+        if run is not None:
+            wandb.finish()
 
 
 def parse_args() -> argparse.Namespace:
@@ -592,6 +605,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in checkpoint-dir")
     parser.add_argument("--resume-from", type=str, default=None, help="Optional explicit .safetensors path to resume from")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases telemetry logging")
     return parser.parse_args()
 
 
@@ -618,4 +632,5 @@ if __name__ == "__main__":
         save_interval=cli_args.save_interval,
         resume=cli_args.resume,
         resume_from=cli_args.resume_from,
+        no_wandb=cli_args.no_wandb,
     )

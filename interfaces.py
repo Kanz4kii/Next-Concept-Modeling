@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import Any, NamedTuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -12,18 +14,20 @@ import torch.nn as nn
 class ModelArgs:
     """Configuration arguments for the Next-Concept Modeling (NCM) architecture."""
 
-    vocab_size: int = 32000
-    dim: int = 512
-    concept_dim: int = 256
+    vocab_size: int = 50304
+    dim: int = 768
+    concept_dim: int = 384
     num_concepts: int = 1024
     num_quantizers: int = 4
     downsample_rate: int = 4
-    planner_layers: int = 6
-    decoder_layers: int = 6
+    planner_layers: int = 5
+    decoder_layers: int = 5
     num_heads: int = 8
     dropout: float = 0.0
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024
     rope_theta: float = 10000.0
+    version: str = "v2"
+    decoder_type: str = "semi_autoregressive"  # "semi_autoregressive" (v2) or "non_autoregressive" (v1)
 
     def __post_init__(self) -> None:
         assert isinstance(self.vocab_size, int) and self.vocab_size > 0, "vocab_size must be a positive int"
@@ -43,6 +47,32 @@ class ModelArgs:
         assert self.max_seq_len % self.downsample_rate == 0, (
             f"max_seq_len ({self.max_seq_len}) must be divisible by downsample_rate ({self.downsample_rate})"
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializes ModelArgs into a JSON-compatible dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ModelArgs:
+        """Instantiates ModelArgs from a dictionary, safely filtering unrecognized keys."""
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
+
+    def save_json(self, path: Union[str, Path]) -> Path:
+        """Saves configuration to a JSON file."""
+        target_path = Path(path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        return target_path
+
+    @classmethod
+    def from_json(cls, path: Union[str, Path]) -> ModelArgs:
+        """Loads configuration from a JSON file."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
 
 
 class TokenizerOutput(NamedTuple):

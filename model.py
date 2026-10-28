@@ -32,7 +32,15 @@ class NCMModel(nn.Module):
         self.text_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.tokenizer = ConceptTokenizer(args=args)
         self.planner = ConceptPlanner(args=args)
-        self.decoder = SurfaceDecoder(args=args)
+
+        # Select surface realizer based on config (v2 Semi-Autoregressive vs v1 Non-Autoregressive)
+        is_v1 = (getattr(args, "decoder_type", "semi_autoregressive") == "non_autoregressive") or (getattr(args, "version", "v2") == "v1")
+        if is_v1:
+            from decoder import NonAutoregressiveDecoder
+            self.decoder = NonAutoregressiveDecoder(args=args)
+        else:
+            from decoder import SemiAutoregressiveDecoder
+            self.decoder = SemiAutoregressiveDecoder(args=args)
 
         nn.init.normal_(self.text_embeddings.weight, mean=0.0, std=0.02)
         self.tie_weights()
@@ -94,14 +102,53 @@ class NCMModel(nn.Module):
     def from_safetensors(
         cls,
         checkpoint_path: Union[str, Path],
-        args: ModelArgs,
+        args: Optional[ModelArgs] = None,
         device: Union[str, torch.device] = "cpu",
     ) -> NCMModel:
-        """Loads a pretrained NCMModel from a `.safetensors` file and restores weight tying."""
+        """Loads a pretrained NCMModel from a `.safetensors` file, auto-detecting config if omitted."""
         from safetensors.torch import load_file
 
+        ckpt_path = Path(checkpoint_path)
+        state_dict = load_file(str(ckpt_path), device=str(device))
+
+        if args is None:
+            # 1. Try config.json in the same directory as the checkpoint
+            local_config = ckpt_path.parent / "config.json"
+            if local_config.exists():
+                args = ModelArgs.from_json(local_config)
+            else:
+                # 2. Automatically infer ModelArgs architecture from state_dict keys and tensor shapes
+                has_token_gate = "decoder.token_gate" in state_dict or "decoder.bos_emb" in state_dict
+                version = "v2" if has_token_gate else "v1"
+                decoder_type = "semi_autoregressive" if has_token_gate else "non_autoregressive"
+
+                vocab_size = state_dict["text_embeddings.weight"].shape[0] if "text_embeddings.weight" in state_dict else 50304
+                dim = state_dict["text_embeddings.weight"].shape[1] if "text_embeddings.weight" in state_dict else 768
+                concept_dim = state_dict["tokenizer.to_concept.weight"].shape[0] if "tokenizer.to_concept.weight" in state_dict else 384
+                num_quantizers = len([k for k in state_dict if "planner.concept_embs." in k and ".weight" in k]) or 4
+
+                p_layers = [int(k.split(".")[2]) for k in state_dict if k.startswith("planner.layers.") and ".attn." in k]
+                planner_layers = (max(p_layers) + 1) if p_layers else 5
+
+                d_layers = [int(k.split(".")[2]) for k in state_dict if k.startswith("decoder.layers.") and ".attn." in k]
+                decoder_layers = (max(d_layers) + 1) if d_layers else 5
+
+                args = ModelArgs(
+                    vocab_size=vocab_size,
+                    dim=dim,
+                    concept_dim=concept_dim,
+                    num_concepts=1024,
+                    num_quantizers=num_quantizers,
+                    downsample_rate=4,
+                    planner_layers=planner_layers,
+                    decoder_layers=decoder_layers,
+                    num_heads=8,
+                    max_seq_len=1024,
+                    version=version,
+                    decoder_type=decoder_type,
+                )
+
         model = cls(args=args).to(device)
-        state_dict = load_file(str(checkpoint_path), device=str(device))
         model.load_state_dict(state_dict, strict=False)
         model.tie_weights()
         return model

@@ -1,0 +1,16 @@
+{
+  "version": "v2",
+  "decoder_type": "semi_autoregressive",
+  "vocab_size": 50304,
+  "dim": 768,
+  "concept_dim": 384,
+  "num_concepts": 1024,
+  "num_quantizers": 4,
+  "downsample_rate": 4,
+  "planner_layers": 5,
+  "decoder_layers": 5,
+  "num_heads": 8,
+  "dropout": 0.0,
+  "max_seq_len": 1024,
+  "rope_theta": 10000.0
+}

@@ -62,7 +62,9 @@ def prepare_fineweb_bin(
             f"Will skip first {existing_train_tokens:,} tokens and append up to {max_tokens:,} tokens..."
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    tok_dir = Path("tokenizer")
+    tok_src = tok_dir if (tok_dir.is_dir() and (tok_dir / "tokenizer.json").exists() and tokenizer_name == "gpt2") else tokenizer_name
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, use_fast=True)
     tokenizer.model_max_length = int(1e9)
     assert tokenizer.vocab_size <= np.iinfo(np.uint16).max, (
         f"Tokenizer vocab_size ({tokenizer.vocab_size}) exceeds uint16 max (65535)"
