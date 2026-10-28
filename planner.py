@@ -135,11 +135,19 @@ class CausalSelfAttention(nn.Module):
 
         if kv_cache is not None:
             k_prev, v_prev = kv_cache
-            k = torch.cat([k_prev, k], dim=2)                           # [B, H, K_total, head_dim]
-            v = torch.cat([v_prev, v], dim=2)                           # [B, H, K_total, head_dim]
-
-        new_kv_cache = (k, v)
-        is_causal = (kv_cache is None) and (K > 1)
+            if k_prev.size(2) >= start_pos + K:
+                k_prev[:, :, start_pos : start_pos + K, :] = k
+                v_prev[:, :, start_pos : start_pos + K, :] = v
+                k = k_prev[:, :, : start_pos + K, :]
+                v = v_prev[:, :, : start_pos + K, :]
+                new_kv_cache = (k_prev, v_prev)
+            else:
+                k = torch.cat([k_prev, k], dim=2)
+                v = torch.cat([v_prev, v], dim=2)
+                new_kv_cache = (k, v)
+        else:
+            new_kv_cache = (k, v)
+        is_causal = (start_pos == 0) and (K > 1)
 
         attn_out = F.scaled_dot_product_attention(
             q,
@@ -478,15 +486,25 @@ class ConceptPlanner(nn.Module):
         prompt_indices: torch.Tensor,
         prompt_latents: Optional[torch.Tensor] = None,
     ) -> list[Optional[tuple[torch.Tensor, torch.Tensor]]]:
-        """Populates the Planner KV-cache over prefix concepts."""
-        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [None] * len(self.layers)
+        """Populates a static pre-allocated Planner KV-cache over prefix concepts."""
+        B = prompt_indices.size(0)
+        H = self.layers[0].attn.num_heads
+        head_dim = self.layers[0].attn.head_dim
+        dtype = torch.bfloat16 if (prompt_indices.is_cuda and torch.is_autocast_enabled()) else self.concept_embs[0].weight.dtype
+        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [
+            (
+                torch.empty((B, H, self.max_concepts, head_dim), dtype=dtype, device=prompt_indices.device),
+                torch.empty((B, H, self.max_concepts, head_dim), dtype=dtype, device=prompt_indices.device),
+            )
+            for _ in range(len(self.layers))
+        ]
         if prompt_indices.size(1) == 0:
             return kv_caches
         x = self._embed_indices(prompt_indices)
         if prompt_latents is not None:
             x = x + prompt_latents.to(dtype=x.dtype)
         for i, layer in enumerate(self.layers):
-            x, kv_caches[i] = layer(x, kv_cache=None, start_pos=0)
+            x, kv_caches[i] = layer(x, kv_cache=kv_caches[i], start_pos=0)
         return kv_caches
 
     @torch.compiler.disable

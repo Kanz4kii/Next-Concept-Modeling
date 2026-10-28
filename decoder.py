@@ -56,11 +56,19 @@ class SurfaceSelfAttention(nn.Module):
 
         if kv_cache is not None:
             k_prev, v_prev = kv_cache
-            k = torch.cat([k_prev, k], dim=2)                           # [B, H, T_total, head_dim]
-            v = torch.cat([v_prev, v], dim=2)                           # [B, H, T_total, head_dim]
-
-        new_kv_cache = (k, v)
-        use_causal = self.is_causal and (kv_cache is None) and (T > 1)
+            if k_prev.size(2) >= start_pos + T:
+                k_prev[:, :, start_pos : start_pos + T, :] = k
+                v_prev[:, :, start_pos : start_pos + T, :] = v
+                k = k_prev[:, :, : start_pos + T, :]
+                v = v_prev[:, :, : start_pos + T, :]
+                new_kv_cache = (k_prev, v_prev)
+            else:
+                k = torch.cat([k_prev, k], dim=2)
+                v = torch.cat([v_prev, v], dim=2)
+                new_kv_cache = (k, v)
+        else:
+            new_kv_cache = (k, v)
+        use_causal = self.is_causal and (start_pos == 0) and (T > 1)
 
         attn_out = F.scaled_dot_product_attention(
             q,
@@ -314,9 +322,18 @@ class SemiAutoregressiveDecoder(nn.Module):
             t_in = bos
 
         x = self.concept_gate * c_up + self.token_gate * self.token_norm(t_in)
-        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [None] * len(self.layers)
+        H = self.layers[0].attn.num_heads
+        head_dim = self.layers[0].attn.head_dim
+        dtype = torch.bfloat16 if (x.is_cuda and torch.is_autocast_enabled()) else x.dtype
+        kv_caches: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [
+            (
+                torch.empty((B, H, self.max_seq_len, head_dim), dtype=dtype, device=x.device),
+                torch.empty((B, H, self.max_seq_len, head_dim), dtype=dtype, device=x.device),
+            )
+            for _ in range(len(self.layers))
+        ]
         for i, layer in enumerate(self.layers):
-            x, kv_caches[i] = layer(x, kv_cache=None, start_pos=0)
+            x, kv_caches[i] = layer(x, kv_cache=kv_caches[i], start_pos=0)
         return kv_caches
 
     @torch.compiler.disable

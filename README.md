@@ -130,8 +130,9 @@ To evaluate the efficiency gains of Hierarchical Concept Modeling over standard 
 | **Model Parameters** | 124.48M (12 layers, $D=768$) | **101.88M** (5 planner + 5 decoder) | **18.2% leaner** |
 | **Train Throughput ($B=4, T=1024$ — In-VRAM)** | 6,667 tok/s (`7,055 MB`) | **23,359 tok/s** (`3,233 MB`) | **`3.50x` faster & `2.18x` less VRAM** |
 | **Train Throughput ($B=8, T=1024$ — High Batch)** | 455 tok/s (`13,063 MB` — *RAM paging*) | **27,652 tok/s** (`5,583 MB`) | **`60.8x` faster (no VRAM spillover)** |
-| **Single-Stream Inference ($B=1, 128\text{ tok}$)** | 67.1 tok/s (`1,908 ms`) | **122.4 tok/s** (`1,045 ms`) | **`1.82x` faster latency** |
+| **Single-Stream Inference ($B=1, 128\text{ tok}$)** | 67.1 tok/s (`1,908 ms`) | **122.4 tok/s** (`1,045 ms`) | **`1.82x` faster latency** *(CPU/WDDM dispatch bound)* |
 | **Batched Inference ($B=16, 2048\text{ tok}$)** | 1,060.8 tok/s | **1,948.7 tok/s** | **`1.84x` higher throughput** |
+| **High-Batch Inference ($B=64, 8192\text{ tok}$)** | 3,840.2 tok/s | **7,357.2 tok/s** (`1,113 ms`) | **`1.92x` higher throughput** |
 | **High-Level Attention Complexity** | $O(T^2) = 1,048,576$ pairs | $O((T/4)^2) = 65,536$ pairs | **`16x` fewer attention pairs** |
 | **Total Layer Passes ($T=1024$)** | $12 \times 1024 = \mathbf{12,288}$ | $(5 \times 256) + (5 \times 1024) = \mathbf{6,400}$ | **`47.9%` fewer layer-token passes** |
 
