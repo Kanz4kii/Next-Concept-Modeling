@@ -30,17 +30,20 @@ $$
 While expressive, token-level autoregression forces the entire model capacity to perform both high-level semantic planning and low-level syntactic realization at every single step.
 
 **Next-Concept Modeling (NCM)** splits this process into two hierarchical levels:
-1. **Concept Planning (`ConceptPlanner`)**: Compress spans of $r = 4$ tokens into a single discrete latent concept $c_k \in \mathcal{C}$ via **Residual Vector Quantization (RVQ)**. A causal transformer plans trajectories autoregressively in compressed concept space at $4\times$ temporal reduction:
 
-   $$
-   P(c_1, c_2, \dots, c_K) = \prod_{k=1}^{K} P(c_k \mid c_{\lt k})
-   $$
+### Level 1: Concept Planning (`ConceptPlanner`)
+Compress spans of $r = 4$ tokens into a single discrete latent concept $c_k \in \mathcal{C}$ via **Residual Vector Quantization (RVQ)**. A causal transformer plans trajectories autoregressively in compressed concept space at $4\times$ temporal reduction:
 
-2. **Semi-Autoregressive Surface Realization (`SemiAutoregressiveDecoder`)**: Given the planned concept $c_k$ and the causal history of tokens within the block, realize surface text with causal conditioning:
+$$
+P(c_1, c_2, \dots, c_K) = \prod_{k=1}^{K} P(c_k \mid c_{\lt k})
+$$
 
-   $$
-   P(y_{4k-3:4k} \mid c_k, y_{\lt 4k-3}) = \prod_{j=0}^{r-1} P(y_{4k-3+j} \mid y_{\lt 4k-3+j}, c_k)
-   $$
+### Level 2: Semi-Autoregressive Surface Realization (`SemiAutoregressiveDecoder`)
+Given the planned concept $c_k$ and the causal history of tokens within the block, realize surface text with causal conditioning:
+
+$$
+P(y_{4k-3:4k} \mid c_k, y_{\lt 4k-3}) = \prod_{j=0}^{r-1} P(y_{4k-3+j} \mid y_{\lt 4k-3+j}, c_k)
+$$
 
 ---
 
@@ -343,19 +346,21 @@ $$
 \mathcal{L} = \mathcal{L}_{\text{text}} + \lambda_{\text{concept}} \cdot \mathcal{L}_{\text{concept}} + \mathcal{L}_{\text{VQ}}
 $$
 
-1. **Surface Realization Loss**:
-   $$
-   \mathcal{L}_{\text{text}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(y_t \mid y_{\lt t}, c_{\le \lceil t/r \rceil})
-   $$
-2. **Next-Concept Planning Loss**:
-   $$
-   \mathcal{L}_{\text{concept}} = -\frac{1}{K-1}\sum_{k=1}^{K-1} \frac{1}{Q}\sum_{q=1}^{Q} \log P\bigl(c_{k+1}^{(q)} \mid c_{\le k}\bigr)
-   $$
-3. **Residual Vector Quantization Loss**:
-   $$
-   \mathcal{L}_{\text{VQ}} = \frac{1}{Q}\sum_{q=1}^{Q} \beta \cdot \| \text{sg}[z^{(q)}] - e^{(q)} \|_2^2
-   $$
-   where $\beta = 0.25$ and the **Rotation Trick** transports gradients across the discrete codebook bottleneck without bias.
+### 1. Surface Realization Loss
+$$
+\mathcal{L}_{\text{text}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(y_t \mid y_{\lt t}, c_{\le \lceil t/r \rceil})
+$$
+
+### 2. Next-Concept Planning Loss
+$$
+\mathcal{L}_{\text{concept}} = -\frac{1}{K-1}\sum_{k=1}^{K-1} \frac{1}{Q}\sum_{q=1}^{Q} \log P\bigl(c_{k+1}^{(q)} \mid c_{\le k}\bigr)
+$$
+
+### 3. Residual Vector Quantization Loss
+$$
+\mathcal{L}_{\text{VQ}} = \frac{1}{Q}\sum_{q=1}^{Q} \beta \cdot \| \text{sg}[z^{(q)}] - e^{(q)} \|_2^2
+$$
+where $\beta = 0.25$ and the **Rotation Trick** transports gradients across the discrete codebook bottleneck without bias.
 
 ---
 
