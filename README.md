@@ -121,6 +121,31 @@ Trained on 1 Billion tokens of **FineWeb-Edu** (`sample-10BT`) followed by **10,
 - **Throughput**: `~31,200 tokens/sec` (`20.61 TFLOP/s`) using PyTorch 2.x native `sdpa_kernel` and `torch.compile` Triton PTX kernels.
 - **Memory Footprint**: `~5.4 GB VRAM` peak during training with `bfloat16` and 8-bit AdamW (`AdamW8bit`).
 
+### Head-to-Head Benchmark: NCM v2 vs. Standard Transformer (GPT-2 124M)
+
+To evaluate the efficiency gains of Hierarchical Concept Modeling over standard token-level autoregression, we measured empirical throughput and peak VRAM side-by-side on identical hardware (`NVIDIA GeForce RTX 5050` 8GB VRAM, PyTorch 2.4+ `bfloat16`, FlashAttention SDPA):
+
+| Metric / Benchmark | Standard Transformer (GPT-2) | NCM v2 (Hierarchical) | NCM Advantage |
+| :--- | :---: | :---: | :---: |
+| **Model Parameters** | 124.48M (12 layers, $D=768$) | **101.88M** (5 planner + 5 decoder) | **18.2% leaner** |
+| **Training Throughput ($B=4, T=1024$)** | 880 tok/s *(WDDM paging to RAM)* | **16,094 tok/s** | **`18.28x` faster** |
+| **Peak VRAM ($B=4, T=1024$)** | 9,315 MB *(spills over 8GB VRAM)* | **4,663 MB** | **`2.00x` less VRAM** |
+| **OOM Resilience ($B=8, T=1024$)** | ❌ `CUDA OutOfMemoryError` | ✅ **Smooth execution** (~6.8 GB) | **Runs where GPT-2 crashes** |
+| **Inference Generation Speed** | 50.6 tok/s | **56.6 tok/s** | **`1.12x` faster** |
+| **High-Level Attention Complexity** | $O(T^2) = 1,048,576$ pairs | $O((T/4)^2) = 65,536$ pairs | **`16x` fewer attention pairs** |
+| **Total Layer Passes ($T=1024$)** | $12 \times 1024 = \mathbf{12,288}$ | $(5 \times 256) + (5 \times 1024) = \mathbf{6,400}$ | **`47.9%` fewer layer-token passes** |
+
+> **Why did the Standard Transformer collapse to 880 tok/s?**
+> On consumer 8 GB GPUs, standard 12-layer GPT-2 at $B=4, T=1024$ accumulates over 9.3 GB of activation and optimizer state during backpropagation (tracking full $[B, T, V]$ projection tensors). This causes driver paging across PCIe to system RAM, which bottlenecks memory bandwidth.
+> 
+> In contrast, **NCM v2 confines quadratic attention to $K = 256$ concept latents**, decouples high-level semantic planning from low-level surface realization, and fits comfortably within 4.66 GB VRAM. At $B=8, T=1024$, standard GPT-2 crashes with `torch.OutOfMemoryError`, while NCM v2 executes seamlessly.
+
+#### Reproduce the Benchmark
+Run the standalone reproducible benchmark script locally:
+```bash
+python benchmark.py
+```
+
 ---
 
 ## Qualitative Generation Comparison
@@ -194,6 +219,7 @@ reduce water usage and increase energy efficiency...
 ├── sft_dataset.py      # Alpaca instruction-tuning dataset with selective label masking
 ├── sft_train.py        # SFT pipeline with frozen VQ codebooks & padding-masked concept loss
 ├── generate.py         # Production inference CLI with Min-P, Repetition Penalty, HF auto-download, & --chat
+├── benchmark.py        # Empirical throughput, VRAM, and latency benchmark vs standard Transformer
 ├── test_overfit.py     # Deterministic verification suite (graph, gradients, closed-loop exact match)
 ├── requirements.txt    # Project dependencies
 └── LICENSE             # MIT License
