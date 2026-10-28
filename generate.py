@@ -120,7 +120,7 @@ def main() -> None:
         print("=" * 80)
         print("[Notice] Pretrained .safetensors checkpoint not found locally.")
         print("To download the trained weights from Hugging Face:")
-        print("    python generate.py --hf-repo kanzaki4real/ncm-100m")
+        print("    python generate.py --hf-repo Kanz4kii/Next-Concept-Modeling")
         print("Or place your checkpoint at 'checkpoints_v2/ncm_sft_best.safetensors'.")
         print("Initializing model with random weights for zero-crash pipeline test...")
         print("=" * 80)
