@@ -128,7 +128,7 @@ def prepare_staging_dir(
             shutil.copy2(item, staging_dir / item.name)
 
     print(f"[4/4] Generating Hugging Face Model Card (README.md)...")
-    model_card = MODEL_CARD_TEMPLATE.format(repo_id=repo_id)
+    model_card = MODEL_CARD_TEMPLATE.replace("{repo_id}", repo_id)
     (staging_dir / "README.md").write_text(model_card, encoding="utf-8")
 
 

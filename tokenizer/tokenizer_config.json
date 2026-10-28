@@ -4,7 +4,7 @@
   "bos_token": "<|endoftext|>",
   "eos_token": "<|endoftext|>",
   "errors": "replace",
-  "is_local": false,
+  "is_local": true,
   "local_files_only": false,
   "model_max_length": 1024,
   "pad_token": null,
